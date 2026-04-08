@@ -10,13 +10,18 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+/* ================= ROOT ROUTE ================= */
+app.get("/", (req, res) => {
+  res.send("Backend is running 🚀");
+});
+
 /* ================= DB CONNECTION ================= */
 mongoose
   .connect(process.env.MONGO_URI)
   .then(() => console.log("MongoDB Atlas connected ✅"))
-  .catch((err) => console.log(err));
+  .catch((err) => console.log("Mongo Error:", err));
 
-/* ================= RAZORPAY SETUP ================= */
+/* ================= RAZORPAY ================= */
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY,
   key_secret: process.env.RAZORPAY_SECRET,
@@ -34,8 +39,13 @@ const parkingSchema = new mongoose.Schema({
 const Parking = mongoose.model("Parking", parkingSchema);
 
 app.get("/parking", async (req, res) => {
-  const data = await Parking.find();
-  res.json(data);
+  try {
+    const data = await Parking.find();
+    res.json(data);
+  } catch (err) {
+    console.log("Parking Error:", err);
+    res.status(500).json({ error: "Failed to fetch parking data" });
+  }
 });
 
 /* ================= USER ================= */
@@ -79,6 +89,7 @@ app.post("/signup", async (req, res) => {
 
     res.json({ message: "Signup successful", user });
   } catch (err) {
+    console.log(err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -96,6 +107,7 @@ app.post("/login", async (req, res) => {
 
     res.json({ message: "Login successful", user });
   } catch (err) {
+    console.log(err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -189,108 +201,7 @@ app.post("/book", async (req, res) => {
 
     res.json({ booking });
   } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-/* ================= CREATE ORDER ================= */
-app.post("/create-order", async (req, res) => {
-  try {
-    const { bookingId, amount } = req.body;
-
-    let finalAmount = amount;
-
-    if (bookingId) {
-      const booking = await Booking.findById(bookingId);
-      if (!booking) {
-        return res.status(404).json({ message: "Booking not found" });
-      }
-      finalAmount = booking.totalAmount;
-    }
-
-    if (!finalAmount) {
-      return res.status(400).json({ message: "Amount required" });
-    }
-
-    const options = {
-      amount: finalAmount * 100,
-      currency: "INR",
-      receipt: "receipt_" + Date.now(),
-    };
-
-    const order = await razorpay.orders.create(options);
-    res.json(order);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-/* ================= VERIFY PAYMENT ================= */
-app.post("/verify-payment", async (req, res) => {
-  try {
-    const {
-      razorpay_order_id,
-      razorpay_payment_id,
-      razorpay_signature,
-      bookingId,
-    } = req.body;
-
-    const body = razorpay_order_id + "|" + razorpay_payment_id;
-
-    const expectedSignature = crypto
-      .createHmac("sha256", process.env.RAZORPAY_SECRET)
-      .update(body)
-      .digest("hex");
-
-    if (expectedSignature === razorpay_signature) {
-      const booking = await Booking.findById(bookingId);
-
-      if (!booking) {
-        return res.status(404).json({ message: "Booking not found" });
-      }
-
-      const qrData = JSON.stringify({
-        bookingId: booking._id,
-        parkingName: booking.parkingName,
-        vehicle: booking.vehicleNumber,
-        amount: booking.totalAmount,
-        time: new Date(),
-      });
-
-      booking.paymentStatus = "Paid";
-      booking.razorpay_payment_id = razorpay_payment_id;
-      booking.qrData = qrData;
-
-      await booking.save();
-
-      res.json({ success: true });
-    } else {
-      res.status(400).json({ success: false });
-    }
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-/* ================= GET BOOKINGS ================= */
-app.get("/my-bookings/:userId", async (req, res) => {
-  try {
-    const bookings = await Booking.find({
-      userId: req.params.userId,
-    }).sort({ date: -1 });
-
-    res.json(bookings);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-/* ================= CANCEL BOOKING ================= */
-app.delete("/cancel-booking/:id", async (req, res) => {
-  try {
-    await Booking.findByIdAndDelete(req.params.id);
-    res.json({ message: "Booking cancelled successfully" });
-  } catch (err) {
+    console.log(err);
     res.status(500).json({ error: err.message });
   }
 });
