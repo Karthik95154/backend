@@ -99,15 +99,21 @@ app.post("/login", async (req, res) => {
   try {
     const { email, password } = req.body;
 
-    const user = await User.findOne({ email, password });
+    console.log("LOGIN:", email, password);
+
+    const user = await User.findOne({ email: email.trim() });
 
     if (!user) {
-      return res.status(400).json({ message: "Invalid credentials" });
+      return res.status(400).json({ message: "User not found" });
+    }
+
+    if (user.password !== password) {
+      return res.status(400).json({ message: "Wrong password" });
     }
 
     res.json({ message: "Login successful", user });
   } catch (err) {
-    console.log(err);
+    console.log("Login error:", err);
     res.status(500).json({ error: err.message });
   }
 });
