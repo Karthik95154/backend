@@ -10,12 +10,12 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-/* ================= ROOT ROUTE ================= */
+/* ================= ROOT ================= */
 app.get("/", (req, res) => {
   res.send("Backend is running 🚀");
 });
 
-/* ================= DB CONNECTION ================= */
+/* ================= DB ================= */
 mongoose
   .connect(process.env.MONGO_URI)
   .then(() => console.log("MongoDB Atlas connected ✅"))
@@ -43,7 +43,6 @@ app.get("/parking", async (req, res) => {
     const data = await Parking.find();
     res.json(data);
   } catch (err) {
-    console.log("Parking Error:", err);
     res.status(500).json({ error: "Failed to fetch parking data" });
   }
 });
@@ -63,21 +62,6 @@ app.post("/signup", async (req, res) => {
   try {
     const { name, email, phone, password } = req.body;
 
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    const phoneRegex = /^[6-9]\d{9}$/;
-
-    if (!name || !email || !phone || !password) {
-      return res.status(400).json({ message: "All fields required" });
-    }
-
-    if (!emailRegex.test(email)) {
-      return res.status(400).json({ message: "Invalid email" });
-    }
-
-    if (!phoneRegex.test(phone)) {
-      return res.status(400).json({ message: "Invalid phone number" });
-    }
-
     const existing = await User.findOne({ email });
 
     if (existing) {
@@ -89,7 +73,6 @@ app.post("/signup", async (req, res) => {
 
     res.json({ message: "Signup successful", user });
   } catch (err) {
-    console.log(err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -98,8 +81,6 @@ app.post("/signup", async (req, res) => {
 app.post("/login", async (req, res) => {
   try {
     const { email, password } = req.body;
-
-    console.log("LOGIN:", email, password);
 
     const user = await User.findOne({ email: email.trim() });
 
@@ -113,7 +94,6 @@ app.post("/login", async (req, res) => {
 
     res.json({ message: "Login successful", user });
   } catch (err) {
-    console.log("Login error:", err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -137,7 +117,6 @@ const bookingSchema = new mongoose.Schema({
   },
   razorpay_order_id: String,
   razorpay_payment_id: String,
-  qrData: String,
   date: {
     type: Date,
     default: Date.now,
@@ -149,65 +128,79 @@ const Booking = mongoose.model("Booking", bookingSchema);
 /* ================= CREATE BOOKING ================= */
 app.post("/book", async (req, res) => {
   try {
-    const {
-      userId,
-      userName,
-      phone,
-      vehicleNumber,
-      parkingId,
-      parkingName,
-      hours,
-      pricePerHour,
-      totalAmount,
-      startTime,
-      endTime,
-      paymentStatus,
-      paymentId,
-    } = req.body;
-
-    if (!userId || !vehicleNumber) {
-      return res.status(400).json({ message: "Missing required fields" });
-    }
-
-    const vehicleRegex = /^[A-Z]{2}[0-9]{2}[A-Z]{2}[0-9]{4}$/i;
-    if (!vehicleRegex.test(vehicleNumber)) {
-      return res.status(400).json({ message: "Invalid vehicle number" });
-    }
-
-    let finalHours = hours;
-
-    if (!finalHours && startTime && endTime) {
-      finalHours = Math.max(
-        1,
-        (new Date(endTime) - new Date(startTime)) / (1000 * 60 * 60)
-      );
-    }
-
-    const finalAmount =
-      totalAmount ||
-      (finalHours && pricePerHour ? finalHours * pricePerHour : 0);
+    const data = req.body;
 
     const booking = new Booking({
-      userId,
-      userName: userName || "User",
-      phone: phone || "N/A",
-      vehicleNumber: vehicleNumber.toUpperCase(),
-      parkingId,
-      parkingName,
-      hours: finalHours || 1,
-      pricePerHour: pricePerHour || 0,
-      totalAmount: finalAmount,
-      startTime,
-      endTime,
-      paymentStatus: paymentStatus || "Pending",
-      razorpay_payment_id: paymentId || null,
+      ...data,
+      vehicleNumber: data.vehicleNumber.toUpperCase(),
     });
 
     await booking.save();
 
     res.json({ booking });
   } catch (err) {
-    console.log(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ================= CREATE ORDER ================= */
+app.post("/create-order", async (req, res) => {
+  try {
+    const { bookingId } = req.body;
+
+    if (!bookingId) {
+      return res.status(400).json({ error: "Booking ID required" });
+    }
+
+    const booking = await Booking.findById(bookingId);
+
+    if (!booking) {
+      return res.status(404).json({ error: "Booking not found" });
+    }
+
+    const order = await razorpay.orders.create({
+      amount: booking.totalAmount * 100,
+      currency: "INR",
+      receipt: "receipt_" + bookingId,
+    });
+
+    res.json(order);
+  } catch (err) {
+    console.log("Create Order Error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ================= VERIFY PAYMENT ================= */
+app.post("/verify-payment", async (req, res) => {
+  try {
+    const {
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature,
+      bookingId,
+    } = req.body;
+
+    const body = razorpay_order_id + "|" + razorpay_payment_id;
+
+    const expectedSignature = crypto
+      .createHmac("sha256", process.env.RAZORPAY_SECRET)
+      .update(body)
+      .digest("hex");
+
+    if (expectedSignature === razorpay_signature) {
+      await Booking.findByIdAndUpdate(bookingId, {
+        paymentStatus: "Paid",
+        razorpay_order_id,
+        razorpay_payment_id,
+      });
+
+      res.json({ success: true });
+    } else {
+      res.status(400).json({ success: false });
+    }
+  } catch (err) {
+    console.log("Verify Error:", err);
     res.status(500).json({ error: err.message });
   }
 });
