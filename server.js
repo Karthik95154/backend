@@ -1,3 +1,5 @@
+require("dotenv").config();
+
 const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
@@ -10,17 +12,14 @@ app.use(express.json());
 
 /* ================= DB CONNECTION ================= */
 mongoose
-  .connect("mongodb+srv://karthik:Karthik951%40@cluster0.auw8xop.mongodb.net/parkingDB")
+  .connect(process.env.MONGO_URI)
   .then(() => console.log("MongoDB Atlas connected ✅"))
   .catch((err) => console.log(err));
 
 /* ================= RAZORPAY SETUP ================= */
-const RAZORPAY_KEY_ID = "rzp_test_SYvFiZFRu1TNNt";
-const RAZORPAY_SECRET = "sAsdpro7nRKW5STE1n6FQtlx";
-
 const razorpay = new Razorpay({
-  key_id: RAZORPAY_KEY_ID,
-  key_secret: RAZORPAY_SECRET,
+  key_id: process.env.RAZORPAY_KEY,
+  key_secret: process.env.RAZORPAY_SECRET,
 });
 
 /* ================= PARKING ================= */
@@ -114,18 +113,13 @@ const bookingSchema = new mongoose.Schema({
   totalAmount: Number,
   startTime: Date,
   endTime: Date,
-
   paymentStatus: {
     type: String,
     default: "Pending",
   },
-
   razorpay_order_id: String,
   razorpay_payment_id: String,
-
-  // 🔥 NEW FIELD
   qrData: String,
-
   date: {
     type: Date,
     default: Date.now,
@@ -195,7 +189,6 @@ app.post("/book", async (req, res) => {
 
     res.json({ booking });
   } catch (err) {
-    console.log(err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -226,14 +219,13 @@ app.post("/create-order", async (req, res) => {
     };
 
     const order = await razorpay.orders.create(options);
-
     res.json(order);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-/* ================= VERIFY PAYMENT (UPDATED) ================= */
+/* ================= VERIFY PAYMENT ================= */
 app.post("/verify-payment", async (req, res) => {
   try {
     const {
@@ -246,7 +238,7 @@ app.post("/verify-payment", async (req, res) => {
     const body = razorpay_order_id + "|" + razorpay_payment_id;
 
     const expectedSignature = crypto
-      .createHmac("sha256", RAZORPAY_SECRET)
+      .createHmac("sha256", process.env.RAZORPAY_SECRET)
       .update(body)
       .digest("hex");
 
@@ -257,7 +249,6 @@ app.post("/verify-payment", async (req, res) => {
         return res.status(404).json({ message: "Booking not found" });
       }
 
-      // 🔳 CREATE QR DATA
       const qrData = JSON.stringify({
         bookingId: booking._id,
         parkingName: booking.parkingName,
@@ -266,7 +257,6 @@ app.post("/verify-payment", async (req, res) => {
         time: new Date(),
       });
 
-      // 💾 SAVE
       booking.paymentStatus = "Paid";
       booking.razorpay_payment_id = razorpay_payment_id;
       booking.qrData = qrData;
@@ -306,6 +296,8 @@ app.delete("/cancel-booking/:id", async (req, res) => {
 });
 
 /* ================= SERVER ================= */
-app.listen(5000, "0.0.0.0", () => {
-  console.log("Server running on port 5000 🚀");
+const PORT = process.env.PORT || 5000;
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT} 🚀`);
 });
