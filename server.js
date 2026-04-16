@@ -154,45 +154,45 @@ app.post("/verify-payment", async (req, res) => {
       bookingId,
     } = req.body;
 
-    const body = razorpay_order_id + "|" + razorpay_payment_id;
+    console.log("DATA:", req.body);
+
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing payment data",
+      });
+    }
 
     const expectedSignature = crypto
       .createHmac("sha256", process.env.RAZORPAY_SECRET)
-      .update(body)
+      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
       .digest("hex");
 
     console.log("EXPECTED:", expectedSignature);
     console.log("RECEIVED:", razorpay_signature);
 
-    if (expectedSignature === razorpay_signature) {
-      const booking = await Booking.findById(bookingId);
-
-      if (!booking)
-        return res.status(404).json({ message: "Booking not found" });
-
-      // ✅ FIX: CHECK ORDER MATCH
-      if (booking.razorpay_order_id !== razorpay_order_id) {
-        return res
-          .status(400)
-          .json({ success: false, error: "Order mismatch" });
-      }
-
-      const qrData = JSON.stringify({
-        bookingId: booking._id,
-        vehicle: booking.vehicleNumber,
-        amount: booking.totalAmount,
+    // 🔥 TEMP DEBUG (REMOVE AFTER TEST)
+    if (expectedSignature !== razorpay_signature) {
+      console.log("SIGNATURE FAILED");
+      return res.json({
+        success: false,
+        error: "Signature mismatch",
       });
-
-      booking.paymentStatus = "Paid";
-      booking.razorpay_payment_id = razorpay_payment_id;
-      booking.qrData = qrData;
-
-      await booking.save();
-
-      res.json({ success: true });
-    } else {
-      res.status(400).json({ success: false, error: "Invalid signature" });
     }
+
+    const booking = await Booking.findById(bookingId);
+
+    if (!booking) {
+      return res.status(404).json({ message: "Booking not found" });
+    }
+
+    booking.paymentStatus = "Paid";
+    booking.razorpay_payment_id = razorpay_payment_id;
+
+    await booking.save();
+
+    res.json({ success: true });
+
   } catch (err) {
     console.log("VERIFY ERROR:", err);
     res.status(500).json({ error: err.message });
