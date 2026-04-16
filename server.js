@@ -222,15 +222,20 @@ app.post("/create-order", async (req, res) => {
       receipt: "receipt_" + Date.now(),
     };
 
-  const order = await razorpay.orders.create(options);
+    const order = await razorpay.orders.create(options);
 
-if (bookingId) {
-  await Booking.findByIdAndUpdate(bookingId, {
-    razorpay_order_id: order.id,
-  });
-}
+    if (bookingId) {
+      await Booking.findByIdAndUpdate(bookingId, {
+        razorpay_order_id: order.id,
+      });
+    }
 
-res.json(order);
+    res.json(order);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+}); // ✅ THIS CLOSING BRACKET WAS MISSING
+
 /* ================= VERIFY PAYMENT (UPDATED) ================= */
 app.post("/verify-payment", async (req, res) => {
   try {
@@ -243,10 +248,10 @@ app.post("/verify-payment", async (req, res) => {
 
     const body = razorpay_order_id + "|" + razorpay_payment_id;
 
-   const expectedSignature = crypto
-  .createHmac("sha256", process.env.RAZORPAY_SECRET)
-  .update(body)
-  .digest("hex");
+    const expectedSignature = crypto
+      .createHmac("sha256", process.env.RAZORPAY_SECRET)
+      .update(body)
+      .digest("hex");
 
     if (expectedSignature === razorpay_signature) {
       const booking = await Booking.findById(bookingId);
