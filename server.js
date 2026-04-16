@@ -111,12 +111,18 @@ const bookingSchema = new mongoose.Schema({
   totalAmount: Number,
   startTime: Date,
   endTime: Date,
+
   paymentStatus: {
     type: String,
     default: "Pending",
   },
+
   razorpay_order_id: String,
   razorpay_payment_id: String,
+
+  // 🔥 NEW FIELD
+  qrData: String,
+
   date: {
     type: Date,
     default: Date.now,
@@ -128,17 +134,65 @@ const Booking = mongoose.model("Booking", bookingSchema);
 /* ================= CREATE BOOKING ================= */
 app.post("/book", async (req, res) => {
   try {
-    const data = req.body;
+    const {
+      userId,
+      userName,
+      phone,
+      vehicleNumber,
+      parkingId,
+      parkingName,
+      hours,
+      pricePerHour,
+      totalAmount,
+      startTime,
+      endTime,
+      paymentStatus,
+      paymentId,
+    } = req.body;
+
+    if (!userId || !vehicleNumber) {
+      return res.status(400).json({ message: "Missing required fields" });
+    }
+
+    const vehicleRegex = /^[A-Z]{2}[0-9]{2}[A-Z]{2}[0-9]{4}$/i;
+    if (!vehicleRegex.test(vehicleNumber)) {
+      return res.status(400).json({ message: "Invalid vehicle number" });
+    }
+
+    let finalHours = hours;
+
+    if (!finalHours && startTime && endTime) {
+      finalHours = Math.max(
+        1,
+        (new Date(endTime) - new Date(startTime)) / (1000 * 60 * 60)
+      );
+    }
+
+    const finalAmount =
+      totalAmount ||
+      (finalHours && pricePerHour ? finalHours * pricePerHour : 0);
 
     const booking = new Booking({
-      ...data,
-      vehicleNumber: data.vehicleNumber.toUpperCase(),
+      userId,
+      userName: userName || "User",
+      phone: phone || "N/A",
+      vehicleNumber: vehicleNumber.toUpperCase(),
+      parkingId,
+      parkingName,
+      hours: finalHours || 1,
+      pricePerHour: pricePerHour || 0,
+      totalAmount: finalAmount,
+      startTime,
+      endTime,
+      paymentStatus: paymentStatus || "Pending",
+      razorpay_payment_id: paymentId || null,
     });
 
     await booking.save();
 
     res.json({ booking });
   } catch (err) {
+    console.log(err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -146,32 +200,37 @@ app.post("/book", async (req, res) => {
 /* ================= CREATE ORDER ================= */
 app.post("/create-order", async (req, res) => {
   try {
-    const { bookingId } = req.body;
+    const { bookingId, amount } = req.body;
 
-    if (!bookingId) {
-      return res.status(400).json({ error: "Booking ID required" });
+    let finalAmount = amount;
+
+    if (bookingId) {
+      const booking = await Booking.findById(bookingId);
+      if (!booking) {
+        return res.status(404).json({ message: "Booking not found" });
+      }
+      finalAmount = booking.totalAmount;
     }
 
-    const booking = await Booking.findById(bookingId);
-
-    if (!booking) {
-      return res.status(404).json({ error: "Booking not found" });
+    if (!finalAmount) {
+      return res.status(400).json({ message: "Amount required" });
     }
 
-    const order = await razorpay.orders.create({
-      amount: booking.totalAmount * 100,
+    const options = {
+      amount: finalAmount * 100,
       currency: "INR",
-      receipt: "receipt_" + bookingId,
-    });
+      receipt: "receipt_" + Date.now(),
+    };
+
+    const order = await razorpay.orders.create(options);
 
     res.json(order);
   } catch (err) {
-    console.log("Create Order Error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-/* ================= VERIFY PAYMENT ================= */
+/* ================= VERIFY PAYMENT (UPDATED) ================= */
 app.post("/verify-payment", async (req, res) => {
   try {
     const {
@@ -184,23 +243,61 @@ app.post("/verify-payment", async (req, res) => {
     const body = razorpay_order_id + "|" + razorpay_payment_id;
 
     const expectedSignature = crypto
-      .createHmac("sha256", process.env.RAZORPAY_SECRET)
+      .createHmac("sha256", RAZORPAY_SECRET)
       .update(body)
       .digest("hex");
 
     if (expectedSignature === razorpay_signature) {
-      await Booking.findByIdAndUpdate(bookingId, {
-        paymentStatus: "Paid",
-        razorpay_order_id,
-        razorpay_payment_id,
+      const booking = await Booking.findById(bookingId);
+
+      if (!booking) {
+        return res.status(404).json({ message: "Booking not found" });
+      }
+
+      // 🔳 CREATE QR DATA
+      const qrData = JSON.stringify({
+        bookingId: booking._id,
+        parkingName: booking.parkingName,
+        vehicle: booking.vehicleNumber,
+        amount: booking.totalAmount,
+        time: new Date(),
       });
+
+      // 💾 SAVE
+      booking.paymentStatus = "Paid";
+      booking.razorpay_payment_id = razorpay_payment_id;
+      booking.qrData = qrData;
+
+      await booking.save();
 
       res.json({ success: true });
     } else {
       res.status(400).json({ success: false });
     }
   } catch (err) {
-    console.log("Verify Error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ================= GET BOOKINGS ================= */
+app.get("/my-bookings/:userId", async (req, res) => {
+  try {
+    const bookings = await Booking.find({
+      userId: req.params.userId,
+    }).sort({ date: -1 });
+
+    res.json(bookings);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ================= CANCEL BOOKING ================= */
+app.delete("/cancel-booking/:id", async (req, res) => {
+  try {
+    await Booking.findByIdAndDelete(req.params.id);
+    res.json({ message: "Booking cancelled successfully" });
+  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
