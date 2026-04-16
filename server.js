@@ -35,6 +35,7 @@ const parkingSchema = new mongoose.Schema({
   latitude: Number,
   longitude: Number,
 });
+
 const Parking = mongoose.model("Parking", parkingSchema);
 
 app.get("/parking", async (req, res) => {
@@ -53,6 +54,7 @@ const userSchema = new mongoose.Schema({
   phone: String,
   password: String,
 });
+
 const User = mongoose.model("User", userSchema);
 
 /* ================= SIGNUP ================= */
@@ -61,8 +63,10 @@ app.post("/signup", async (req, res) => {
     const { name, email, phone, password } = req.body;
 
     const existing = await User.findOne({ email });
-    if (existing)
+
+    if (existing) {
       return res.status(400).json({ message: "User already exists" });
+    }
 
     const user = new User({ name, email, phone, password });
     await user.save();
@@ -76,15 +80,19 @@ app.post("/signup", async (req, res) => {
 /* ================= LOGIN ================= */
 app.post("/login", async (req, res) => {
   try {
-    const user = await User.findOne({ email: req.body.email });
+    const { email, password } = req.body;
 
-    if (!user)
+    const user = await User.findOne({ email: email.trim() });
+
+    if (!user) {
       return res.status(400).json({ message: "User not found" });
+    }
 
-    if (user.password !== req.body.password)
+    if (user.password !== password) {
       return res.status(400).json({ message: "Wrong password" });
+    }
 
-    res.json({ user });
+    res.json({ message: "Login successful", user });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -98,21 +106,37 @@ const bookingSchema = new mongoose.Schema({
   vehicleNumber: String,
   parkingId: String,
   parkingName: String,
-  spotId: String,
   hours: Number,
+  pricePerHour: Number,
   totalAmount: Number,
-  paymentStatus: { type: String, default: "Pending" },
+  startTime: Date,
+  endTime: Date,
+  paymentStatus: {
+    type: String,
+    default: "Pending",
+  },
   razorpay_order_id: String,
   razorpay_payment_id: String,
-  qrData: String,
-  date: { type: Date, default: Date.now },
+  date: {
+    type: Date,
+    default: Date.now,
+  },
 });
+
 const Booking = mongoose.model("Booking", bookingSchema);
 
+/* ================= CREATE BOOKING ================= */
 app.post("/book", async (req, res) => {
   try {
-    const booking = new Booking(req.body);
+    const data = req.body;
+
+    const booking = new Booking({
+      ...data,
+      vehicleNumber: data.vehicleNumber.toUpperCase(),
+    });
+
     await booking.save();
+
     res.json({ booking });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -124,22 +148,25 @@ app.post("/create-order", async (req, res) => {
   try {
     const { bookingId } = req.body;
 
+    if (!bookingId) {
+      return res.status(400).json({ error: "Booking ID required" });
+    }
+
     const booking = await Booking.findById(bookingId);
-    if (!booking)
-      return res.status(404).json({ message: "Booking not found" });
+
+    if (!booking) {
+      return res.status(404).json({ error: "Booking not found" });
+    }
 
     const order = await razorpay.orders.create({
       amount: booking.totalAmount * 100,
       currency: "INR",
-      receipt: "receipt_" + Date.now(),
+      receipt: "receipt_" + bookingId,
     });
-
-    // ✅ FIX: SAVE ORDER ID
-    booking.razorpay_order_id = order.id;
-    await booking.save();
 
     res.json(order);
   } catch (err) {
+    console.log("Create Order Error:", err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -154,55 +181,28 @@ app.post("/verify-payment", async (req, res) => {
       bookingId,
     } = req.body;
 
-    console.log("DATA:", req.body);
-
-    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
-      return res.status(400).json({
-        success: false,
-        error: "Missing payment data",
-      });
-    }
+    const body = razorpay_order_id + "|" + razorpay_payment_id;
 
     const expectedSignature = crypto
       .createHmac("sha256", process.env.RAZORPAY_SECRET)
-      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+      .update(body)
       .digest("hex");
 
-    console.log("EXPECTED:", expectedSignature);
-    console.log("RECEIVED:", razorpay_signature);
-
-    // 🔥 TEMP DEBUG (REMOVE AFTER TEST)
-    if (expectedSignature !== razorpay_signature) {
-      console.log("SIGNATURE FAILED");
-      return res.json({
-        success: false,
-        error: "Signature mismatch",
+    if (expectedSignature === razorpay_signature) {
+      await Booking.findByIdAndUpdate(bookingId, {
+        paymentStatus: "Paid",
+        razorpay_order_id,
+        razorpay_payment_id,
       });
+
+      res.json({ success: true });
+    } else {
+      res.status(400).json({ success: false });
     }
-
-    const booking = await Booking.findById(bookingId);
-
-    if (!booking) {
-      return res.status(404).json({ message: "Booking not found" });
-    }
-
-    booking.paymentStatus = "Paid";
-    booking.razorpay_payment_id = razorpay_payment_id;
-
-    await booking.save();
-
-    res.json({ success: true });
-
   } catch (err) {
-    console.log("VERIFY ERROR:", err);
+    console.log("Verify Error:", err);
     res.status(500).json({ error: err.message });
   }
-});
-
-/* ================= GET BOOKINGS ================= */
-app.get("/my-bookings/:userId", async (req, res) => {
-  const bookings = await Booking.find({ userId: req.params.userId });
-  res.json(bookings);
 });
 
 /* ================= SERVER ================= */
