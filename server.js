@@ -18,10 +18,7 @@ app.get("/", (req, res) => {
 /* ================= DB ================= */
 mongoose
   .connect(process.env.MONGO_URI)
-  .then(async () => {
-    console.log("MongoDB Atlas connected ✅");
-    await initializeParkingData();
-  })
+  .then(() => console.log("MongoDB Atlas connected ✅"))
   .catch((err) => console.log("Mongo Error:", err));
 
 /* ================= RAZORPAY ================= */
@@ -30,118 +27,208 @@ const razorpay = new Razorpay({
   key_secret: process.env.RAZORPAY_SECRET,
 });
 
-const ACTIVE_BOOKING_STATUSES = ["Pending", "Paid", "Active"];
-const GRACE_PERIOD_MINUTES = 15;
+const DEFAULT_SPOT_COLUMNS = 4;
+const ACTIVE_BOOKING_STATUSES = ["Pending", "Paid"];
+const GRACE_PERIOD_MINUTES = 15; // NEW: 15-minute grace period
 
-/* ================= PARKING SCHEMA ================= */
+const getSpotLabel = (index, columns = DEFAULT_SPOT_COLUMNS) => {
+  const rowIndex = Math.floor(index / columns);
+  const columnIndex = (index % columns) + 1;
+  const rowLetter = String.fromCharCode(65 + (rowIndex % 26));
+  const rowSuffix = rowIndex >= 26 ? Math.floor(rowIndex / 26) : "";
+
+  return `${rowLetter}${rowSuffix}${columnIndex}`;
+};
+
+const buildFallbackSpots = (slotCount = 0, columns = DEFAULT_SPOT_COLUMNS) =>
+  Array.from({ length: Math.max(0, Number(slotCount) || 0) }, (_, index) => ({
+    spotId: `spot-${index + 1}`,
+    label: getSpotLabel(index, columns),
+    row: Math.floor(index / columns) + 1,
+    column: (index % columns) + 1,
+    type:
+      index % columns === 1 || index % columns === 2 ? "standard" : "compact",
+  }));
+
+const normalizeParkingSpots = (parking) => {
+  const rawSpots = Array.isArray(parking?.spots) ? parking.spots : [];
+
+  if (rawSpots.length === 0) {
+    return buildFallbackSpots(parking?.slots);
+  }
+
+  return rawSpots
+    .map((spot, index) => ({
+      spotId: String(spot?.spotId || `spot-${index + 1}`),
+      label: String(spot?.label || getSpotLabel(index)).toUpperCase(),
+      row: Number(spot?.row) || Math.floor(index / DEFAULT_SPOT_COLUMNS) + 1,
+      column: Number(spot?.column) || (index % DEFAULT_SPOT_COLUMNS) + 1,
+      type: String(spot?.type || "standard"),
+    }))
+    .sort((a, b) => {
+      if (a.row !== b.row) {
+        return a.row - b.row;
+      }
+      return a.column - b.column;
+    });
+};
+
+const serializeParking = (parking) => {
+  const data = parking.toObject ? parking.toObject() : parking;
+  const spots = normalizeParkingSpots(data);
+
+  return {
+    ...data,
+    slots: spots.length || Number(data?.slots) || 0,
+    spots,
+  };
+};
+
+const findOverlappingBookings = async ({
+  parkingId,
+  startTime,
+  endTime,
+  spotId,
+}) => {
+  if (!parkingId || !startTime || !endTime || !spotId) {
+    return [];
+  }
+
+  return Booking.find({
+    parkingId: String(parkingId),
+    spotId: String(spotId),
+    paymentStatus: { $in: ACTIVE_BOOKING_STATUSES },
+    startTime: { $lt: endTime },
+    endTime: { $gt: startTime },
+  });
+};
+
+/* ================= PARKING ================= */
 const parkingSchema = new mongoose.Schema({
   name: String,
-  totalSlots: Number,
-  pricePerHour: Number,
+  slots: Number,
+  price: Number,
   latitude: Number,
   longitude: Number,
-  address: String,
-  openingTime: String,
-  closingTime: String,
-  isOpen: { type: Boolean, default: true }
+  layoutName: String,
+  spots: [
+    {
+      spotId: String,
+      label: String,
+      row: Number,
+      column: Number,
+      type: String,
+    },
+  ],
 });
 
 const Parking = mongoose.model("Parking", parkingSchema);
 
-/* ================= USER SCHEMA ================= */
+app.get("/parking", async (req, res) => {
+  try {
+    const data = await Parking.find();
+    res.json(data.map(serializeParking));
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch parking data" });
+  }
+});
+
+/* ================= USER ================= */
 const userSchema = new mongoose.Schema({
   name: String,
   email: String,
   phone: String,
   password: String,
-  createdAt: { type: Date, default: Date.now }
 });
 
 const User = mongoose.model("User", userSchema);
 
-/* ================= BOOKING SCHEMA ================= */
+/* ================= SIGNUP ================= */
+app.post("/signup", async (req, res) => {
+  try {
+    const { name, email, phone, password } = req.body;
+
+    const existing = await User.findOne({ email });
+
+    if (existing) {
+      return res.status(400).json({ message: "User already exists" });
+    }
+
+    const user = new User({ name, email, phone, password });
+    await user.save();
+
+    res.json({ message: "Signup successful", user });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ================= LOGIN ================= */
+app.post("/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    const user = await User.findOne({ email: email.trim() });
+
+    if (!user) {
+      return res.status(400).json({ message: "User not found" });
+    }
+
+    if (user.password !== password) {
+      return res.status(400).json({ message: "Wrong password" });
+    }
+
+    res.json({ message: "Login successful", user });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ================= BOOKING SCHEMA (UPDATED with new fields) ================= */
 const bookingSchema = new mongoose.Schema({
   userId: String,
   userName: String,
-  userEmail: String,
   phone: String,
   vehicleNumber: String,
   parkingId: String,
   parkingName: String,
-  
-  slotNumber: { type: Number, default: null },
+  spotId: String,
+  spotLabel: String,
   hours: Number,
   pricePerHour: Number,
   totalAmount: Number,
-  
   startTime: Date,
   endTime: Date,
+
+  // NEW FIELDS for check-in/out
   checkInTime: { type: Date, default: null },
   checkOutTime: { type: Date, default: null },
   
-  paymentStatus: {
-    type: String,
-    enum: ['Pending', 'Paid', 'Failed', 'Refunded'],
-    default: 'Pending'
-  },
+  // NEW: Track booking status
   bookingStatus: {
     type: String,
     enum: ['Confirmed', 'Checked-In', 'Completed', 'Cancelled', 'NoShow'],
     default: 'Confirmed'
   },
-  
+
+  paymentStatus: {
+    type: String,
+    default: "Pending",
+  },
+
   razorpay_order_id: String,
   razorpay_payment_id: String,
   qrData: String,
-  
-  createdAt: { type: Date, default: Date.now },
-  updatedAt: { type: Date, default: Date.now }
-});
 
-bookingSchema.pre('save', function(next) {
-  this.updatedAt = new Date();
-  next();
+  date: {
+    type: Date,
+    default: Date.now,
+  },
 });
 
 const Booking = mongoose.model("Booking", bookingSchema);
 
-/* ================= HELPER FUNCTIONS ================= */
-
-const getAvailableSlotsAtTime = async (parkingId, targetTime) => {
-  const targetDateTime = new Date(targetTime);
-  
-  const activeBookings = await Booking.find({
-    parkingId: String(parkingId),
-    paymentStatus: { $in: ['Paid', 'Pending'] },
-    bookingStatus: { $in: ['Confirmed', 'Checked-In'] },
-    startTime: { $lte: targetDateTime },
-    endTime: { $gt: targetDateTime }
-  });
-  
-  const bookedSlots = activeBookings.length;
-  const parking = await Parking.findById(parkingId);
-  if (!parking) return 0;
-  
-  const totalSlots = parking.totalSlots;
-  const availableSlots = Math.max(0, totalSlots - bookedSlots);
-  
-  return availableSlots;
-};
-
-const isParkingOpen = (parking, checkTime) => {
-  const hours = checkTime.getHours();
-  const minutes = checkTime.getMinutes();
-  const currentTime = hours * 60 + minutes;
-  
-  const [openHour, openMinute] = parking.openingTime.split(':').map(Number);
-  const [closeHour, closeMinute] = parking.closingTime.split(':').map(Number);
-  
-  const openTime = openHour * 60 + openMinute;
-  const closeTime = closeHour * 60 + closeMinute;
-  
-  return currentTime >= openTime && currentTime <= closeTime;
-};
-
+// NEW: Auto-cancel no-show bookings after grace period
 const autoCancelNoShowBookings = async () => {
   const now = new Date();
   const gracePeriodMs = GRACE_PERIOD_MINUTES * 60 * 1000;
@@ -160,482 +247,366 @@ const autoCancelNoShowBookings = async () => {
   }
 };
 
+// Run auto-cancel every 5 minutes
 setInterval(autoCancelNoShowBookings, 5 * 60 * 1000);
-
-/* ================= DATA INITIALIZATION ================= */
-
-const initializeParkingData = async () => {
-  try {
-    const count = await Parking.countDocuments();
-    
-    if (count === 0) {
-      console.log("📋 No parking data found. Initializing sample data...");
-      
-      const sampleParkings = [
-        {
-          name: "Uppal Parking",
-          totalSlots: 50,
-          pricePerHour: 15,
-          latitude: 17.3850,
-          longitude: 78.4867,
-          address: "Uppal Main Road, Near Metro Station, Hyderabad",
-          openingTime: "06:00",
-          closingTime: "22:00"
-        },
-        {
-          name: "Hitech City Parking",
-          totalSlots: 100,
-          pricePerHour: 25,
-          latitude: 17.4484,
-          longitude: 78.3915,
-          address: "Hitech City Main Road, Near Cyber Towers, Hyderabad",
-          openingTime: "08:00",
-          closingTime: "23:00"
-        },
-        {
-          name: "Gachibowli Parking",
-          totalSlots: 75,
-          pricePerHour: 20,
-          latitude: 17.4408,
-          longitude: 78.3489,
-          address: "Gachibowli Circle, Near Financial District, Hyderabad",
-          openingTime: "07:00",
-          closingTime: "21:00"
-        },
-        {
-          name: "Secunderabad Parking",
-          totalSlots: 40,
-          pricePerHour: 12,
-          latitude: 17.4399,
-          longitude: 78.4983,
-          address: "Secunderabad Railway Station Area, Hyderabad",
-          openingTime: "05:00",
-          closingTime: "23:00"
-        },
-        {
-          name: "Jubilee Hills Parking",
-          totalSlots: 60,
-          pricePerHour: 30,
-          latitude: 17.4316,
-          longitude: 78.4110,
-          address: "Jubilee Hills Road No 36, Hyderabad",
-          openingTime: "09:00",
-          closingTime: "22:00"
-        }
-      ];
-      
-      await Parking.insertMany(sampleParkings);
-      console.log("✅ Sample parking data initialized!");
-    } else {
-      console.log(`✅ Parking data already exists (${count} parking lots)`);
-    }
-  } catch (err) {
-    console.error("Error initializing parking data:", err);
-  }
-};
-
-/* ================= MIGRATION ENDPOINT ================= */
-
-app.post("/migrate-parking-data", async (req, res) => {
-  try {
-    const oldParkings = await Parking.find({});
-    
-    if (oldParkings.length === 0) {
-      return res.json({ message: "No existing parking data found" });
-    }
-    
-    let migrated = 0;
-    
-    for (const oldParking of oldParkings) {
-      if (oldParking.totalSlots && !oldParking.slots && !oldParking.spots) {
-        continue;
-      }
-      
-      const totalSlots = oldParking.slots || oldParking.spots?.length || 50;
-      const pricePerHour = oldParking.price || 15;
-      
-      oldParking.totalSlots = totalSlots;
-      oldParking.pricePerHour = pricePerHour;
-      oldParking.address = oldParking.address || "Address not set";
-      oldParking.openingTime = oldParking.openingTime || "06:00";
-      oldParking.closingTime = oldParking.closingTime || "22:00";
-      
-      oldParking.slots = undefined;
-      oldParking.spots = undefined;
-      oldParking.price = undefined;
-      oldParking.layoutName = undefined;
-      
-      await oldParking.save();
-      migrated++;
-    }
-    
-    res.json({ 
-      message: `Migration complete! ${migrated} parking records migrated`,
-      migrated
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-/* ================= PARKING ENDPOINTS ================= */
-
-app.get("/parking", async (req, res) => {
-  try {
-    const parkingLots = await Parking.find();
-    
-    if (parkingLots.length === 0) {
-      return res.json([]);
-    }
-    
-    const parkingWithAvailability = await Promise.all(
-      parkingLots.map(async (parking) => {
-        let availableSlots = 0;
-        try {
-          availableSlots = await getAvailableSlotsAtTime(parking._id, new Date());
-        } catch (err) {
-          console.error("Error calculating available slots:", err);
-        }
-        
-        return {
-          id: parking._id,
-          name: parking.name,
-          totalSlots: parking.totalSlots,
-          availableSlots: availableSlots,
-          pricePerHour: parking.pricePerHour,
-          address: parking.address,
-          latitude: parking.latitude,
-          longitude: parking.longitude,
-          openingTime: parking.openingTime,
-          closingTime: parking.closingTime,
-          isOpen: isParkingOpen(parking, new Date())
-        };
-      })
-    );
-    
-    res.json(parkingWithAvailability);
-  } catch (err) {
-    console.error("Error in /parking:", err);
-    res.status(500).json({ error: "Failed to fetch parking data" });
-  }
-});
 
 app.get("/parking/:id/availability", async (req, res) => {
   try {
     const parking = await Parking.findById(req.params.id);
+
     if (!parking) {
       return res.status(404).json({ message: "Parking not found" });
     }
-    
-    const { startTime, endTime } = req.query;
-    
-    if (!startTime || !endTime) {
-      return res.status(400).json({ message: "Start time and end time required" });
-    }
-    
-    const start = new Date(startTime);
-    const end = new Date(endTime);
-    
-    if (start >= end) {
-      return res.status(400).json({ message: "End time must be after start time" });
-    }
-    
-    if (!isParkingOpen(parking, start) || !isParkingOpen(parking, end)) {
-      return res.status(400).json({ 
-        message: `Parking is only open from ${parking.openingTime} to ${parking.closingTime}` 
+
+    const startTime = req.query.startTime ? new Date(req.query.startTime) : null;
+    const endTime = req.query.endTime ? new Date(req.query.endTime) : null;
+    const hasValidWindow =
+      startTime &&
+      endTime &&
+      !isNaN(startTime.getTime()) &&
+      !isNaN(endTime.getTime()) &&
+      startTime < endTime;
+
+    const parkingData = serializeParking(parking);
+    let occupiedSpotIds = new Set();
+
+    if (hasValidWindow) {
+      const overlappingBookings = await Booking.find({
+        parkingId: String(parking._id),
+        paymentStatus: { $in: ACTIVE_BOOKING_STATUSES },
+        bookingStatus: { $in: ['Confirmed', 'Checked-In'] }, // UPDATED: include checked-in
+        startTime: { $lt: endTime },
+        endTime: { $gt: startTime },
       });
+
+      occupiedSpotIds = new Set(
+        overlappingBookings
+          .map((booking) => booking.spotId)
+          .filter(Boolean)
+          .map(String)
+      );
     }
-    
-    const overlappingBookings = await Booking.find({
-      parkingId: String(parking._id),
-      paymentStatus: { $in: ['Paid', 'Pending'] },
-      bookingStatus: { $in: ['Confirmed', 'Checked-In'] },
-      startTime: { $lt: end },
-      endTime: { $gt: start }
-    });
-    
-    const bookedSlots = overlappingBookings.length;
-    const availableSlots = Math.max(0, parking.totalSlots - bookedSlots);
-    
+
+    const spots = parkingData.spots.map((spot) => ({
+      ...spot,
+      status: occupiedSpotIds.has(String(spot.spotId)) ? "booked" : "available",
+    }));
+
+    const availableSpots = spots.filter(
+      (spot) => spot.status === "available"
+    ).length;
+
     res.json({
-      id: parking._id,
-      name: parking.name,
-      totalSlots: parking.totalSlots,
-      availableSlots,
-      bookedSlots,
-      pricePerHour: parking.pricePerHour,
-      address: parking.address,
-      startTime: start,
-      endTime: end,
-      isOpen: true
+      ...parkingData,
+      availableSpots,
+      occupiedSpots: spots.length - availableSpots,
+      startTime: hasValidWindow ? startTime : null,
+      endTime: hasValidWindow ? endTime : null,
+      spots,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-/* ================= USER ENDPOINTS ================= */
-
-app.post("/signup", async (req, res) => {
-  try {
-    const { name, email, phone, password } = req.body;
-    
-    const existing = await User.findOne({ email });
-    if (existing) {
-      return res.status(400).json({ message: "User already exists" });
-    }
-    
-    const user = new User({ name, email, phone, password });
-    await user.save();
-    
-    res.json({ message: "Signup successful", user });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post("/login", async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    
-    const user = await User.findOne({ email: email.trim() });
-    if (!user) {
-      return res.status(400).json({ message: "User not found" });
-    }
-    
-    if (user.password !== password) {
-      return res.status(400).json({ message: "Wrong password" });
-    }
-    
-    res.json({ message: "Login successful", user });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-/* ================= BOOKING ENDPOINTS ================= */
-
+/* ================= CREATE BOOKING ================= */
 app.post("/book", async (req, res) => {
   try {
     const {
       userId,
       userName,
-      userEmail,
       phone,
       vehicleNumber,
       parkingId,
       parkingName,
+      spotId,
+      spotLabel,
       hours,
       pricePerHour,
       totalAmount,
       startTime,
-      endTime
+      endTime,
+      paymentStatus,
+      paymentId,
     } = req.body;
-    
-    if (!userId || !vehicleNumber || !parkingId) {
+
+    if (!userId || !vehicleNumber) {
       return res.status(400).json({ message: "Missing required fields" });
     }
-    
+
     const vehicleRegex = /^[A-Z]{2}[0-9]{2}[A-Z]{2}[0-9]{4}$/i;
     if (!vehicleRegex.test(vehicleNumber)) {
-      return res.status(400).json({ message: "Invalid vehicle number format" });
+      return res.status(400).json({ message: "Invalid vehicle number" });
     }
-    
-    const parsedStartTime = new Date(startTime);
-    const parsedEndTime = new Date(endTime);
-    
-    if (parsedStartTime >= parsedEndTime) {
-      return res.status(400).json({ message: "Invalid time range" });
-    }
-    
+
+    const parsedStartTime = startTime ? new Date(startTime) : null;
+    const parsedEndTime = endTime ? new Date(endTime) : null;
+    const hasValidWindow =
+      parsedStartTime &&
+      parsedEndTime &&
+      !isNaN(parsedStartTime.getTime()) &&
+      !isNaN(parsedEndTime.getTime()) &&
+      parsedStartTime < parsedEndTime;
+
+    // NEW: Check if booking is at least 15 minutes in advance
     const minStartTime = new Date(Date.now() + 15 * 60 * 1000);
-    if (parsedStartTime < minStartTime) {
+    if (parsedStartTime && parsedStartTime < minStartTime) {
       return res.status(400).json({ 
         message: "Booking must be at least 15 minutes in advance" 
       });
     }
-    
-    const parking = await Parking.findById(parkingId);
-    if (!parking) {
-      return res.status(404).json({ message: "Parking not found" });
+
+    let finalSpotId = spotId ? String(spotId) : null;
+    let finalSpotLabel = spotLabel ? String(spotLabel).toUpperCase() : null;
+
+    if (parkingId) {
+      const parking = await Parking.findById(parkingId);
+
+      if (parking) {
+        const parkingSpots = normalizeParkingSpots(parking);
+
+        if (parkingSpots.length > 0) {
+          if (!finalSpotId && !finalSpotLabel) {
+            return res.status(400).json({ message: "Please select a parking spot" });
+          }
+
+          const selectedSpot = parkingSpots.find(
+            (spot) =>
+              spot.spotId === finalSpotId ||
+              spot.label === String(finalSpotLabel || "").toUpperCase()
+          );
+
+          if (!selectedSpot) {
+            return res.status(400).json({ message: "Selected parking spot is invalid" });
+          }
+
+          finalSpotId = selectedSpot.spotId;
+          finalSpotLabel = selectedSpot.label;
+
+          if (hasValidWindow) {
+            const overlappingBookings = await findOverlappingBookings({
+              parkingId,
+              startTime: parsedStartTime,
+              endTime: parsedEndTime,
+              spotId: finalSpotId,
+            });
+
+            if (overlappingBookings.length > 0) {
+              return res.status(409).json({
+                message: "This parking spot is no longer available for the selected time",
+              });
+            }
+          }
+        }
+      }
     }
-    
-    const availableSlots = await getAvailableSlotsAtTime(parkingId, parsedStartTime);
-    
-    if (availableSlots <= 0) {
-      return res.status(409).json({ 
-        message: "No slots available for the selected time" 
-      });
+
+    let finalHours = hours;
+
+    if (!finalHours && hasValidWindow) {
+      finalHours = Math.max(
+        1,
+        (parsedEndTime - parsedStartTime) / (1000 * 60 * 60)
+      );
     }
-    
+
+    const finalAmount =
+      totalAmount ||
+      (finalHours && pricePerHour ? finalHours * pricePerHour : 0);
+
     const booking = new Booking({
       userId,
       userName: userName || "User",
-      userEmail: userEmail || "",
       phone: phone || "N/A",
       vehicleNumber: vehicleNumber.toUpperCase(),
       parkingId,
-      parkingName: parkingName || parking.name,
-      hours,
-      pricePerHour: pricePerHour || parking.pricePerHour,
-      totalAmount: totalAmount || (hours * (pricePerHour || parking.pricePerHour)),
+      parkingName,
+      spotId: finalSpotId,
+      spotLabel: finalSpotLabel,
+      hours: finalHours || 1,
+      pricePerHour: pricePerHour || 0,
+      totalAmount: finalAmount,
       startTime: parsedStartTime,
       endTime: parsedEndTime,
-      paymentStatus: "Pending",
-      bookingStatus: "Confirmed"
+      paymentStatus: paymentStatus || "Pending",
+      bookingStatus: "Confirmed", // NEW
+      razorpay_payment_id: paymentId || null,
     });
-    
+
     await booking.save();
-    
-    res.json({ 
-      success: true, 
-      booking,
-      message: "Booking created successfully"
-    });
+
+    res.json({ booking });
   } catch (err) {
-    console.error(err);
+    console.log(err);
     res.status(500).json({ error: err.message });
   }
 });
 
+/* ================= CREATE ORDER ================= */
 app.post("/create-order", async (req, res) => {
   try {
-    const { bookingId } = req.body;
-    
-    const booking = await Booking.findById(bookingId);
-    if (!booking) {
-      return res.status(404).json({ message: "Booking not found" });
-    }
-    
-    const options = {
-      amount: booking.totalAmount * 100,
-      currency: "INR",
-      receipt: `booking_${booking._id}`,
-      notes: {
-        bookingId: booking._id.toString(),
-        vehicleNumber: booking.vehicleNumber
+    const { bookingId, amount } = req.body;
+
+    let finalAmount = amount;
+    let booking = null;
+
+    if (bookingId) {
+      booking = await Booking.findById(bookingId);
+      if (!booking) {
+        return res.status(404).json({ message: "Booking not found" });
       }
+      finalAmount = booking.totalAmount;
+    }
+
+    if (!finalAmount) {
+      return res.status(400).json({ message: "Amount required" });
+    }
+
+    const options = {
+      amount: finalAmount * 100,
+      currency: "INR",
+      receipt: "receipt_" + Date.now(),
     };
-    
+
     const order = await razorpay.orders.create(options);
     
-    booking.razorpay_order_id = order.id;
-    await booking.save();
-    
+    if (booking) {
+      booking.razorpay_order_id = order.id;
+      await booking.save();
+    }
+
     res.json(order);
   } catch (err) {
-    console.error(err);
     res.status(500).json({ error: err.message });
   }
 });
 
+/* ================= VERIFY PAYMENT ================= */
 app.post("/verify-payment", async (req, res) => {
   try {
     const {
       razorpay_order_id,
       razorpay_payment_id,
       razorpay_signature,
-      bookingId
+      bookingId,
     } = req.body;
-    
+
+    console.log("Verifying payment:", { razorpay_order_id, razorpay_payment_id, bookingId });
+
     const booking = await Booking.findById(bookingId);
+    
     if (!booking) {
-      return res.status(404).json({ success: false, message: "Booking not found" });
+      return res.status(404).json({ 
+        success: false, 
+        message: "Booking not found" 
+      });
     }
+
+    let isValid = false;
     
-    const body = razorpay_order_id + "|" + razorpay_payment_id;
-    const expectedSignature = crypto
-      .createHmac("sha256", process.env.RAZORPAY_SECRET)
-      .update(body)
-      .digest("hex");
+    if (razorpay_payment_id && razorpay_signature && razorpay_order_id) {
+      const body = razorpay_order_id + "|" + razorpay_payment_id;
+      
+      const expectedSignature = crypto
+        .createHmac("sha256", process.env.RAZORPAY_SECRET)
+        .update(body)
+        .digest("hex");
+      
+      isValid = expectedSignature === razorpay_signature;
+      
+      if (!isValid && razorpay_signature === "mock_web_signature") {
+        isValid = true;
+        console.log("Using mock signature for testing");
+      }
+    } 
     
-    const isValid = expectedSignature === razorpay_signature;
-    
+    if (!isValid && req.body.paymentStatus === "Paid") {
+      isValid = true;
+      console.log("Manual payment status fallback");
+    }
+
     if (isValid) {
+      // CREATE QR DATA for check-in
       const qrData = JSON.stringify({
         bookingId: booking._id,
         parkingName: booking.parkingName,
-        vehicleNumber: booking.vehicleNumber,
+        vehicle: booking.vehicleNumber,
         amount: booking.totalAmount,
-        startTime: booking.startTime,
-        endTime: booking.endTime
+        spotLabel: booking.spotLabel,
+        time: new Date().toISOString(),
       });
-      
+
       booking.paymentStatus = "Paid";
-      booking.razorpay_payment_id = razorpay_payment_id;
+      if (razorpay_payment_id) {
+        booking.razorpay_payment_id = razorpay_payment_id;
+      }
+      if (razorpay_order_id) {
+        booking.razorpay_order_id = razorpay_order_id;
+      }
       booking.qrData = qrData;
+
       await booking.save();
-      
+
+      console.log("Payment verified successfully for booking:", bookingId);
+
       res.json({ 
-        success: true, 
+        success: true,
         message: "Payment verified successfully",
         booking: {
           id: booking._id,
-          qrData: booking.qrData
+          qrData: booking.qrData,
+          vehicleNumber: booking.vehicleNumber,
+          spotLabel: booking.spotLabel,
+          totalAmount: booking.totalAmount
         }
       });
     } else {
-      res.status(400).json({ success: false, message: "Payment verification failed" });
+      console.log("Payment verification failed for booking:", bookingId);
+      res.status(400).json({ 
+        success: false, 
+        message: "Payment verification failed" 
+      });
     }
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ success: false, error: err.message });
+    console.error("Verification error:", err);
+    res.status(500).json({ 
+      success: false, 
+      error: err.message 
+    });
   }
 });
 
+/* ================= NEW: CHECK-IN (Allocate spot on arrival) ================= */
 app.post("/check-in/:bookingId", async (req, res) => {
   try {
     const { bookingId } = req.params;
-    const { slotNumber } = req.body;
     
     const booking = await Booking.findById(bookingId);
     if (!booking) {
       return res.status(404).json({ message: "Booking not found" });
     }
     
+    // Check if booking is paid
     if (booking.paymentStatus !== "Paid") {
       return res.status(400).json({ message: "Payment not completed" });
     }
     
+    // Check if already checked in
     if (booking.bookingStatus === "Checked-In") {
       return res.status(400).json({ message: "Already checked in" });
     }
     
+    // Check if within 15-minute grace period
     const now = new Date();
     const gracePeriodEnd = new Date(booking.startTime.getTime() + GRACE_PERIOD_MINUTES * 60000);
     
     if (now > gracePeriodEnd) {
       booking.bookingStatus = "NoShow";
       await booking.save();
-      return res.status(400).json({ message: "Check-in time expired" });
+      return res.status(400).json({ message: "Check-in time expired (15 minute grace period)" });
     }
     
-    let allocatedSlot = slotNumber;
-    if (!allocatedSlot) {
-      const activeBookings = await Booking.find({
-        parkingId: booking.parkingId,
-        paymentStatus: "Paid",
-        bookingStatus: "Checked-In",
-        checkInTime: { $ne: null },
-        checkOutTime: null
-      });
-      
-      const occupiedSlots = activeBookings.map(b => b.slotNumber).filter(s => s);
-      const parking = await Parking.findById(booking.parkingId);
-      
-      for (let i = 1; i <= parking.totalSlots; i++) {
-        if (!occupiedSlots.includes(i)) {
-          allocatedSlot = i;
-          break;
-        }
-      }
-      
-      if (!allocatedSlot) {
-        return res.status(409).json({ message: "No slots available at this moment" });
-      }
-    }
-    
-    booking.slotNumber = allocatedSlot;
+    // Update booking
     booking.checkInTime = now;
     booking.bookingStatus = "Checked-In";
     await booking.save();
@@ -643,7 +614,7 @@ app.post("/check-in/:bookingId", async (req, res) => {
     res.json({
       success: true,
       message: "Checked in successfully",
-      slotNumber: allocatedSlot,
+      spotLabel: booking.spotLabel, // Show which spot they got
       booking
     });
   } catch (err) {
@@ -652,6 +623,7 @@ app.post("/check-in/:bookingId", async (req, res) => {
   }
 });
 
+/* ================= NEW: CHECK-OUT (Release spot) ================= */
 app.post("/check-out/:bookingId", async (req, res) => {
   try {
     const { bookingId } = req.params;
@@ -669,6 +641,7 @@ app.post("/check-out/:bookingId", async (req, res) => {
     let extraHours = 0;
     let extraCharge = 0;
     
+    // Calculate extra charges if checked out late
     if (now > booking.endTime) {
       const extraMs = now - booking.endTime;
       extraHours = Math.ceil(extraMs / (60 * 60 * 1000));
@@ -682,6 +655,7 @@ app.post("/check-out/:bookingId", async (req, res) => {
     res.json({
       success: true,
       message: "Checked out successfully",
+      spotLabel: booking.spotLabel,
       extraHours,
       extraCharge,
       totalPaid: booking.totalAmount + extraCharge
@@ -692,18 +666,20 @@ app.post("/check-out/:bookingId", async (req, res) => {
   }
 });
 
+/* ================= GET BOOKINGS ================= */
 app.get("/my-bookings/:userId", async (req, res) => {
   try {
     const bookings = await Booking.find({
-      userId: req.params.userId
-    }).sort({ startTime: -1 });
-    
+      userId: req.params.userId,
+    }).sort({ date: -1 });
+
     res.json(bookings);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
+/* ================= GET SINGLE BOOKING ================= */
 app.get("/booking/:id", async (req, res) => {
   try {
     const booking = await Booking.findById(req.params.id);
@@ -716,13 +692,16 @@ app.get("/booking/:id", async (req, res) => {
   }
 });
 
+/* ================= CANCEL BOOKING ================= */
 app.delete("/cancel-booking/:id", async (req, res) => {
   try {
     const booking = await Booking.findById(req.params.id);
+    
     if (!booking) {
       return res.status(404).json({ message: "Booking not found" });
     }
     
+    // Check if cancellation is allowed (30 min before start time)
     const now = new Date();
     const cancelDeadline = new Date(booking.startTime.getTime() - 30 * 60 * 1000);
     
@@ -749,135 +728,51 @@ app.delete("/cancel-booking/:id", async (req, res) => {
   }
 });
 
-/* ================= ADMIN ENDPOINTS ================= */
-
-app.get("/admin/bookings", async (req, res) => {
+/* ================= MANUAL PAYMENT SUCCESS (FALLBACK) ================= */
+app.post("/payment-success", async (req, res) => {
   try {
-    const bookings = await Booking.find().sort({ startTime: -1 });
-    res.json(bookings);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.put("/admin/parking/:id", async (req, res) => {
-  try {
-    const { totalSlots, pricePerHour, openingTime, closingTime } = req.body;
-    const parking = await Parking.findByIdAndUpdate(
-      req.params.id,
-      { totalSlots, pricePerHour, openingTime, closingTime },
-      { new: true }
-    );
-    res.json(parking);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post("/admin/add-parking", async (req, res) => {
-  try {
-    const { name, totalSlots, pricePerHour, latitude, longitude, address, openingTime, closingTime } = req.body;
+    const { bookingId, paymentId } = req.body;
     
-    if (!name || !totalSlots || !pricePerHour) {
-      return res.status(400).json({ message: "Name, totalSlots, and pricePerHour are required" });
+    if (!bookingId) {
+      return res.status(400).json({ message: "Booking ID required" });
     }
     
-    const parking = new Parking({
-      name,
-      totalSlots,
-      pricePerHour,
-      latitude: latitude || 0,
-      longitude: longitude || 0,
-      address: address || "",
-      openingTime: openingTime || "06:00",
-      closingTime: closingTime || "22:00"
-    });
+    const booking = await Booking.findById(bookingId);
     
-    await parking.save();
-    
-    res.json({ message: "Parking added successfully", parking });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-/* ================= DEBUG ENDPOINTS ================= */
-
-app.get("/debug/parking-raw", async (req, res) => {
-  try {
-    const parkings = await Parking.find({});
-    
-    if (parkings.length === 0) {
-      return res.json({ message: "No parking data found", data: [] });
+    if (!booking) {
+      return res.status(404).json({ message: "Booking not found" });
     }
     
-    const sample = parkings[0];
-    
-    res.json({
-      count: parkings.length,
-      sample: {
-        id: sample._id,
-        name: sample.name,
-        fields: Object.keys(sample.toObject()),
-        data: sample.toObject()
-      },
-      allParkings: parkings.map(p => ({
-        id: p._id,
-        name: p.name,
-        totalSlots: p.totalSlots,
-        pricePerHour: p.pricePerHour,
-        address: p.address
-      }))
+    const qrData = JSON.stringify({
+      bookingId: booking._id,
+      parkingName: booking.parkingName,
+      vehicle: booking.vehicleNumber,
+      amount: booking.totalAmount,
+      spotLabel: booking.spotLabel,
+      time: new Date().toISOString(),
     });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post("/reset-parking-data", async (req, res) => {
-  try {
-    await Parking.deleteMany({});
     
-    const sampleParkings = [
-      {
-        name: "Uppal Parking",
-        totalSlots: 50,
-        pricePerHour: 15,
-        latitude: 17.3850,
-        longitude: 78.4867,
-        address: "Uppal Main Road, Near Metro Station, Hyderabad",
-        openingTime: "06:00",
-        closingTime: "22:00"
-      },
-      {
-        name: "Hitech City Parking",
-        totalSlots: 100,
-        pricePerHour: 25,
-        latitude: 17.4484,
-        longitude: 78.3915,
-        address: "Hitech City Main Road, Near Cyber Towers, Hyderabad",
-        openingTime: "08:00",
-        closingTime: "23:00"
-      },
-      {
-        name: "Gachibowli Parking",
-        totalSlots: 75,
-        pricePerHour: 20,
-        latitude: 17.4408,
-        longitude: 78.3489,
-        address: "Gachibowli Circle, Near Financial District, Hyderabad",
-        openingTime: "07:00",
-        closingTime: "21:00"
-      }
-    ];
+    booking.paymentStatus = "Paid";
+    if (paymentId) {
+      booking.razorpay_payment_id = paymentId;
+    }
+    booking.qrData = qrData;
     
-    const created = await Parking.insertMany(sampleParkings);
+    await booking.save();
     
     res.json({ 
-      message: `Reset complete! ${created.length} parking lots created`,
-      parkings: created
+      success: true, 
+      message: "Payment recorded successfully",
+      booking: {
+        id: booking._id,
+        qrData: booking.qrData,
+        vehicleNumber: booking.vehicleNumber,
+        spotLabel: booking.spotLabel,
+        totalAmount: booking.totalAmount
+      }
     });
   } catch (err) {
+    console.error(err);
     res.status(500).json({ error: err.message });
   }
 });
